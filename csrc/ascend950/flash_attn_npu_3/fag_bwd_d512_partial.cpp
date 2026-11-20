@@ -47,8 +47,9 @@ inline void DispatchLayout(const FagD512PartialLaunchArgs& a)
             DispatchCausalSoftcap<DType, FAGTiling950::Layout::BNSD>(a);
             break;
         case FAGTiling950::Layout::BSND:
-        default:
             DispatchCausalSoftcap<DType, FAGTiling950::Layout::BSND>(a);
+            break;
+        default:
             break;
     }
 }

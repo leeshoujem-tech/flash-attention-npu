@@ -119,7 +119,7 @@ public:
         (BlockTileShape::K > L1TileShape::K) && \
         (L1A_STAGES == 2) && \
         (L1B_STAGES == 2);
-    // D=512：N仍全载，K(D)按L1.K切段，A按L1.M切块双缓冲
+    // D=512: keep N fully resident, split K (D) by L1.K, and double-buffer A by L1.M.
     static constexpr bool ENABLE_A_TILED_B_K_TILED = (BlockTileShape::M > L1TileShape::M) && \
         (BlockTileShape::N == L1TileShape::N) && \
         (BlockTileShape::K > L1TileShape::K) && \
@@ -183,7 +183,8 @@ public:
         }
 
         if constexpr(ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
-            // ENABLE_A_TILED_B_K_TILED：L1B单缓冲、每个K段覆盖写，需要预置"可写"标志
+            // ENABLE_A_TILED_B_K_TILED: L1B is single-buffered and overwritten for
+            // each K segment, so initialize the writable flags.
             for (uint32_t i = 0; i < L1B_STAGES; i++) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
             }
@@ -240,7 +241,8 @@ public:
         AscendC::GlobalTensor<ElementA> const &gmBlockA, LayoutA const &layoutA,
         AscendC::GlobalTensor<ElementB> const &gmBlockB, LayoutB const &layoutB,
         AscendC::GlobalTensor<ElementC> const &gmBlockC, LayoutC const &layoutC,
-        GemmCoord const &actualShape) // actual shape是实际每个block分到的数据量，可能是512*512，也有可能是尾块
+        GemmCoord const &actualShape) // actualShape is the data assigned to this block;
+                                      // it may be a full tile or a tail tile.
     {
         SetFlag();
         if constexpr(ENABLE_A_B_FullLoad) {
@@ -773,7 +775,8 @@ public:
         AscendC::GlobalTensor<ElementC> const &gmBlockC, LayoutC const &layoutC,
         GemmCoord const &actualShape
     )
-    // D=512：N全载，K(D)按L1TileShape::K切段（单缓冲覆盖写），L1A按L1TileShape::M切块双缓冲
+    // D=512: keep N fully resident, split K (D) by L1TileShape::K with a
+    // single overwrite buffer, and double-buffer L1A by L1TileShape::M.
     {
         // Specify single block MM size
         // actual means original shape in GM which may not be block aligned
@@ -781,29 +784,29 @@ public:
         uint32_t actualN = actualShape.n();
         uint32_t actualK = actualShape.k();
 
-        // 基本块都是block对齐的，取数据取到尾块一定是最后一次
+        // Full tiles are block-aligned; a tail tile is always the final tile.
         uint32_t MAlign = RoundUp<L1AAlignHelper::M_ALIGNED>(actualM);
         uint32_t NAlign = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
         uint32_t KAlign = RoundUp<L1BAlignHelper::K_ALIGNED>(actualK);
 
-        // K(D)方向按L1.K切段数、M方向按L1.M切段数、N方向L0刀数
+        // Count K (D) segments by L1.K, M segments by L1.M, and N tiles by L0.
         uint32_t dTileCount = CeilDiv<L1TileShape::K>(KAlign);
         uint32_t mL1TileCount = CeilDiv<L1TileShape::M>(MAlign);
         uint32_t nL0TileCount = CeilDiv<L0TileShape::N>(NAlign);
 
-        // 实际被使用的只有stride（L1布局按L1TileShape，而非actualK）
+        // Only the stride is used; the L1 layout follows L1TileShape rather than actualK.
         auto layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1TileShape::M, L1TileShape::K);
         auto layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(L1TileShape::K, L1TileShape::N);
 
         for (uint32_t dTileIdx = 0; dTileIdx < dTileCount; dTileIdx++) { // DDR2L1LoopK(D)
             uint32_t dBegin = dTileIdx * L1TileShape::K;
             uint32_t dAct = (dTileIdx < dTileCount - 1) ?
-                L1TileShape::K : (actualK - dTileIdx * L1TileShape::K); // 当前K段的实际长度
+                L1TileShape::K : (actualK - dTileIdx * L1TileShape::K); // actual length of this K segment
             uint32_t dActAlign = RoundUp<L1BAlignHelper::K_ALIGNED>(dAct);
-            uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(dActAlign); // 当前K段内的L0 K刀数
+            uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(dActAlign); // L0 K-tile count in this K segment
 
             //====================================L1B MTE2=====================================
-            // 当前K段 x 整段N 覆盖写入同一块L1B
+            // Overwrite the same L1B buffer with this K segment across the full N range.
             auto l1BTensor = l1BTensorList[0];
 
             // BGM Tile Tensor
@@ -813,16 +816,17 @@ public:
             // BGM Tile Layout
             auto layoutTileBInGM = layoutB.GetTileLayout(MakeCoord(dAct, actualN));
 
-            // 覆盖写前等待上一K段的全部L1->L0B(MTE1)消费完成（首段消耗SetFlag预置标志）
+            // Before overwriting, wait for all L1->L0B (MTE1) consumers of the
+            // previous K segment; the first segment consumes the preset flag.
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
             copyGmToL1B(l1BTensor, gmBTile, layoutBInL1, layoutTileBInGM);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]); // notify L1B MTE2 done
 
             for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) { // DDR2L1LoopM
                 uint32_t mL1Act = (mL1TileIdx < mL1TileCount - 1) ?
-                    L1TileShape::M : (actualM - mL1TileIdx * L1TileShape::M); // 当前M段的实际长度
+                    L1TileShape::M : (actualM - mL1TileIdx * L1TileShape::M); // actual length of this M segment
                 uint32_t mL1Align = RoundUp<L1AAlignHelper::M_ALIGNED>(mL1Act);
-                uint32_t mL0TileCount = CeilDiv<L0TileShape::M>(mL1Align); // 当前M段内的L0 M刀数
+                uint32_t mL0TileCount = CeilDiv<L0TileShape::M>(mL1Align); // L0 M-tile count in this M segment
 
                 //====================================L1A MTE2=====================================
                 // L1A Tensor
@@ -902,7 +906,8 @@ public:
                             // Load the current tile from L1 to L0B
                             copyL1ToL0B(l0BTensor, l1BTile, layoutBInL0, layoutBInL1);
 
-                            // 本K段最后一次消费L1B后，允许下一K段覆盖写同一块L1B
+                            // After the last L1B consumer for this K segment, allow
+                            // the next K segment to overwrite the same L1B buffer.
                             if ((mL1TileIdx == mL1TileCount - 1) && (mL0TileIdx == mL0TileCount - 1) &&
                                 (nL0TileIdx == nL0TileCount - 1) && (kL0TileIdx == kL0TileCount - 1)) {
                                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
@@ -957,7 +962,9 @@ public:
                         // L0C Layout
                         auto layoutCInL0 = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0, nL0));
 
-                        // 跨K段的部分和不能在L0C累加：首段普通覆盖写（GM初值是脏数据），后续段用原子加累加
+                        // Partial sums across K segments cannot accumulate in L0C:
+                        // the first segment overwrites the dirty GM value, and later
+                        // segments use atomic accumulation.
                         if (dTileIdx > 0) {
                             AscendC::SetAtomicAdd<float>();
                         }

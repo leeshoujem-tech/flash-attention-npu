@@ -1322,7 +1322,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[2]) && headdim == v_headdim && headdim == dout_headdim,
                 "mha_varlen_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
     TORCH_CHECK(headdim > 0 && headdim <= 512, "mha_varlen_bwd: headdim must be in (0, 512].");
-    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
+    // Deterministic workspace accumulation does not cover D=512 K-tiling; disallow headdim > 256 when enabled.
     TORCH_CHECK(!(deterministic && headdim > 256),
                 "mha_varlen_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(qsizes == dout_sizes, "mha_varlen_bwd: q and dout must have the same shape");
@@ -1557,7 +1557,7 @@ mha_bwd(const at::Tensor& dout,                   // batch_size x seqlen_q x num
     TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[3]) && headdim == v_headdim && headdim == dout_headdim,
                 "mha_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
     TORCH_CHECK(headdim > 0 && headdim <= 512, "mha_bwd: headdim must be in (0, 512].");
-    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
+    // Deterministic workspace accumulation does not cover D=512 K-tiling; disallow headdim > 256 when enabled.
     TORCH_CHECK(!(deterministic && headdim > 256),
                 "mha_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(qsizes == dout_sizes, "mha_bwd: q and dout must have the same shape");
